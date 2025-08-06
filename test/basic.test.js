@@ -197,6 +197,7 @@ async function kickTest () {
       }
     })
 
+
     client.on('error', (err) => {
       clearTimeout(timeout)
       client.close()
