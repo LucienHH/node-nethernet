@@ -86,7 +86,7 @@ async function connectTest () {
       server.close()
       reject(err)
     })
-    
+
     let lastC = 0
     client.on('connected', () => {
       console.log('connected!')
@@ -103,7 +103,7 @@ async function connectTest () {
         client.send(encap)
       })
     })
-    
+
     let lastS = 0
     server.on('encapsulated', (encap) => {
       console.assert(encap[0] === 0xf0)
@@ -122,7 +122,7 @@ async function connectTest () {
         resolve(true)
       }
     })
-    
+
     server.on('openConnection', (client) => {
       console.debug('Client opened connection')
       for (let i = 0; i < 50; i++) {
@@ -147,7 +147,7 @@ async function connectTest () {
       server.close()
       reject(err)
     })
-    
+
     client.connect().catch(err => {
       clearTimeout(timeout)
       client.close()
@@ -176,14 +176,14 @@ async function kickTest () {
       console.log('new connection')
       con.close()
     })
-    
+
     server.listen().catch(err => {
       clearTimeout(timeout)
       client.close()
       server.close()
       reject(err)
     })
-    
+
     client.on('disconnect', packet => {
       console.log('Client got disconnect', packet)
       try {
@@ -196,7 +196,6 @@ async function kickTest () {
         resolve()
       }
     })
-
 
     client.on('error', (err) => {
       clearTimeout(timeout)
