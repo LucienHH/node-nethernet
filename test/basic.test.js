@@ -77,7 +77,7 @@ async function kickTest () {
   return new Promise((resolve, reject) => {
     const server = new Server()
     server.setAdvertisement(Buffer.from([0]))
-    const client = new Client(server.networkId)
+    const client = new Client(server.networkId, { serverAddress: '127.0.0.1' }) // Use localhost for testing
 
     server.on('openConnection', (con) => {
       console.log('new connection')
