@@ -15,6 +15,9 @@ function getBroadcastAddress () {
       }
     }
   }
+  
+  // Fallback to localhost for CI environments or when no suitable interface is found
+  return '127.0.0.1'
 }
 
 module.exports = {
