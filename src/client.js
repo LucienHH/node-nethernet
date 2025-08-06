@@ -20,7 +20,7 @@ const PORT = 7551
 const BROADCAST_ADDRESS = getBroadcastAddress()
 
 class Client extends EventEmitter {
-  constructor (networkId) {
+  constructor (networkId, options = {}) {
     super()
 
     this.serverNetworkId = networkId
@@ -41,6 +41,9 @@ class Client extends EventEmitter {
     this.credentials = []
 
     this.signalHandler = this.sendDiscoveryMessage
+
+    // Allow specifying target address for testing/CI environments
+    this.targetAddress = options.serverAddress || BROADCAST_ADDRESS
 
     this.sendDiscoveryRequest()
 
@@ -165,7 +168,7 @@ class Client extends EventEmitter {
 
     const packetToSend = Buffer.concat([calculateChecksum(buf), encrypt(buf)])
 
-    this.socket.send(packetToSend, PORT, BROADCAST_ADDRESS)
+    this.socket.send(packetToSend, PORT, this.targetAddress)
   }
 
   sendDiscoveryMessage (signal) {
