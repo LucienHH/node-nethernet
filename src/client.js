@@ -43,7 +43,7 @@ class Client extends EventEmitter {
 
     this.credentials = []
 
-    this.signalHandler = this.sendDiscoveryMessage.bind(this)
+    this._signalHandler = this.sendDiscoveryMessage.bind(this)
 
     this.sendDiscoveryRequest()
 
@@ -53,6 +53,18 @@ class Client extends EventEmitter {
 
     this._hasEmittedConnected = false
     this._pendingConnect = false
+    this._externalSignaling = false
+  }
+
+  // Auto-detect external signalling when handler is replaced
+  set signalHandler (handler) {
+    this._signalHandler = handler
+    this._externalSignaling = true
+    debug('Signal handler set, external signaling:', this._externalSignaling)
+  }
+
+  get signalHandler () {
+    return this._signalHandler
   }
 
   async handleCandidate (signal) {
@@ -93,7 +105,7 @@ class Client extends EventEmitter {
         debug('Sending CandidateAdd to networkId:', this.serverNetworkId)
         const signal = new SignalStructure(SignalType.CandidateAdd, this.connectionId, event.candidate.candidate, this.serverNetworkId)
 
-        this.signalHandler(signal)
+        this._signalHandler(signal)
       }
     }
 
@@ -132,7 +144,7 @@ class Client extends EventEmitter {
 
       const localDesc = this.rtcConnection.localDescription
 
-      this.signalHandler(
+      this._signalHandler(
         new SignalStructure(SignalType.ConnectRequest, this.connectionId, localDesc.sdp, this.serverNetworkId)
       )
     } catch (err) {
@@ -166,12 +178,10 @@ class Client extends EventEmitter {
     this.emit('pong', packet.params)
 
     // If connect() was called before discovery completed, initiate connection now
-    if (this._pendingConnect && senderId === BigInt(this.serverNetworkId)) {
+    const serverIdMatches = senderId.toString() === this.serverNetworkId.toString()
+    if (this._pendingConnect && serverIdMatches) {
       this._pendingConnect = false
-      this.createOffer().catch(err => {
-        debug('Failed to create offer after discovery:', err)
-        this.emit('error', err)
-      })
+      this.createOffer()
     }
   }
 
@@ -211,11 +221,6 @@ class Client extends EventEmitter {
   sendDiscoveryMessage (signal) {
     const rinfo = this.addresses.get(BigInt(signal.networkId))
 
-    if (!rinfo) {
-      debug('Address not found for signal, ignoring:', signal.networkId)
-      return
-    }
-
     const packetData = createPacketData('discovery_message', PACKET_TYPE.DISCOVERY_MESSAGE, this.networkId,
       {
         recipient_id: BigInt(signal.networkId),
@@ -230,8 +235,9 @@ class Client extends EventEmitter {
   connect () {
     this.running = true
 
-    const serverNetworkId = BigInt(this.serverNetworkId)
-    if (this.addresses.has(serverNetworkId)) {
+    const hasAddress = this.addresses.has(this.serverNetworkId)
+
+    if (this._externalSignaling || hasAddress) {
       this.createOffer()
     } else {
       this._pendingConnect = true
