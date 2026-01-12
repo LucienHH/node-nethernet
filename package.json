@@ -30,7 +30,7 @@
     "standard": "^17.0.0"
   },
   "dependencies": {
-    "node-datachannel": "^0.26.0",
+    "@roamhq/wrtc": "^0.9.1",
     "protodef": "^1.19.0"
   }
 }

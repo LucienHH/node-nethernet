@@ -1,11 +1,10 @@
 const dgram = require('node:dgram')
 const { EventEmitter } = require('node:events')
-
 const { Connection } = require('./connection')
 const { SignalType, SignalStructure } = require('./signalling')
 
 const { getRandomUint64, createPacketData, prepareSecurePacket, processSecurePacket } = require('./util')
-const { PeerConnection } = require('node-datachannel')
+const { RTCPeerConnection, RTCSessionDescription, RTCIceCandidate } = require('@roamhq/wrtc')
 const { PACKET_TYPE, createSerializer, createDeserializer } = require('./serializer')
 
 const debug = require('debug')('nethernet')
@@ -44,59 +43,102 @@ class Client extends EventEmitter {
 
     this.credentials = []
 
-    this.signalHandler = this.sendDiscoveryMessage
+    this.signalHandler = this.sendDiscoveryMessage.bind(this)
 
     this.sendDiscoveryRequest()
 
     this.pingInterval = setInterval(() => {
       this.sendDiscoveryRequest()
     }, 2000)
+
+    this._hasEmittedConnected = false
+    this._pendingConnect = false
   }
 
   async handleCandidate (signal) {
-    this.rtcConnection.addRemoteCandidate(signal.data, '0')
+    try {
+      if (!this.rtcConnection) {
+        debug('No RTC connection, ignoring candidate')
+        return
+      }
+
+      const candidate = new RTCIceCandidate({ candidate: signal.data, sdpMid: '0', sdpMLineIndex: 0 })
+
+      await this.rtcConnection.addIceCandidate(candidate)
+      debug('Added remote ICE candidate')
+    } catch (err) {
+      debug('Failed to add remote candidate:', err)
+    }
   }
 
   async handleAnswer (signal) {
-    this.rtcConnection.setRemoteDescription(signal.data, 'answer')
+    try {
+      const answer = new RTCSessionDescription({ type: 'answer', sdp: signal.data })
+      await this.rtcConnection.setRemoteDescription(answer)
+      debug('Set remote description (answer)')
+    } catch (err) {
+      debug('Failed to set remote description:', err)
+    }
   }
 
   async createOffer () {
-    this.rtcConnection = new PeerConnection('client', { iceServers: this.credentials })
+    debug('Creating RTCPeerConnection with ICE servers:', this.credentials)
+
+    this.rtcConnection = new RTCPeerConnection({ iceServers: this.credentials })
 
     this.connection = new Connection(this, this.connectionId, this.rtcConnection)
 
-    this.rtcConnection.onLocalCandidate(candidate => {
+    this.rtcConnection.onicecandidate = (event) => {
+      if (event.candidate) {
+        debug('Sending CandidateAdd to networkId:', this.serverNetworkId)
+        const signal = new SignalStructure(SignalType.CandidateAdd, this.connectionId, event.candidate.candidate, this.serverNetworkId)
+
+        this.signalHandler(signal)
+      }
+    }
+
+    this.rtcConnection.onconnectionstatechange = () => {
+      const state = this.rtcConnection.connectionState
+      debug('Client connection state changed:', state)
+      if (state === 'connected' && !this._hasEmittedConnected) {
+        this._hasEmittedConnected = true
+        this.emit('connected', this.connection)
+      }
+      if (state === 'closed' || state === 'disconnected' || state === 'failed') {
+        this.emit('disconnect', this.connectionId, 'disconnected')
+      }
+    }
+
+    this.rtcConnection.oniceconnectionstatechange = () => {
+      const state = this.rtcConnection.iceConnectionState
+      debug('Client ICE state changed:', state)
+      if (state === 'failed') {
+        this.emit('disconnect', this.connectionId, 'disconnected')
+      }
+    }
+
+    const reliableChannel = this.rtcConnection.createDataChannel('ReliableDataChannel', { ordered: true })
+    const unreliableChannel = this.rtcConnection.createDataChannel('UnreliableDataChannel', { ordered: false, maxRetransmits: 0 })
+
+    reliableChannel.binaryType = 'arraybuffer'
+    unreliableChannel.binaryType = 'arraybuffer'
+
+    this.connection.setChannels(reliableChannel, unreliableChannel)
+
+    try {
+      const offer = await this.rtcConnection.createOffer()
+
+      await this.rtcConnection.setLocalDescription(offer)
+
+      const localDesc = this.rtcConnection.localDescription
+
       this.signalHandler(
-        new SignalStructure(SignalType.CandidateAdd, this.connectionId, candidate, this.serverNetworkId)
+        new SignalStructure(SignalType.ConnectRequest, this.connectionId, localDesc.sdp, this.serverNetworkId)
       )
-    })
-
-    this.rtcConnection.onLocalDescription(desc => {
-      const pattern = /o=rtc \d+ 0 IN IP4 127\.0\.0\.1/
-
-      const newOLine = `o=- ${this.networkId} 2 IN IP4 127.0.0.1`
-
-      desc = desc.replace(pattern, newOLine)
-
-      debug('client ICE local description changed', desc)
-      this.signalHandler(
-        new SignalStructure(SignalType.ConnectRequest, this.connectionId, desc, this.serverNetworkId)
-      )
-    })
-
-    this.rtcConnection.onStateChange(state => {
-      debug('Client state changed', state)
-      if (state === 'connected') this.emit('connected', this.connection)
-      if (state === 'closed' || state === 'disconnected' || state === 'failed') this.emit('disconnect', this.connectionId, 'disconnected')
-    })
-
-    setTimeout(() => {
-      this.connection.setChannels(
-        this.rtcConnection.createDataChannel('ReliableDataChannel'),
-        this.rtcConnection.createDataChannel('UnreliableDataChannel')
-      )
-    }, 500)
+    } catch (err) {
+      debug('Failed to create offer:', err)
+      this.emit('error', new Error(`Failed to create offer: ${err.message}`))
+    }
   }
 
   processPacket (buffer, rinfo) {
@@ -122,6 +164,15 @@ class Client extends EventEmitter {
     this.addresses.set(senderId, rinfo)
     this.responses.set(senderId, packet.params)
     this.emit('pong', packet.params)
+
+    // If connect() was called before discovery completed, initiate connection now
+    if (this._pendingConnect && senderId === BigInt(this.serverNetworkId)) {
+      this._pendingConnect = false
+      this.createOffer().catch(err => {
+        debug('Failed to create offer after discovery:', err)
+        this.emit('error', err)
+      })
+    }
   }
 
   handleMessage (packet) {
@@ -161,6 +212,7 @@ class Client extends EventEmitter {
     const rinfo = this.addresses.get(BigInt(signal.networkId))
 
     if (!rinfo) {
+      debug('Address not found for signal, ignoring:', signal.networkId)
       return
     }
 
@@ -175,10 +227,15 @@ class Client extends EventEmitter {
     this.socket.send(packetToSend, rinfo.port, rinfo.address)
   }
 
-  async connect () {
+  connect () {
     this.running = true
 
-    await this.createOffer()
+    const serverNetworkId = BigInt(this.serverNetworkId)
+    if (this.addresses.has(serverNetworkId)) {
+      this.createOffer()
+    } else {
+      this._pendingConnect = true
+    }
   }
 
   send (buffer) {

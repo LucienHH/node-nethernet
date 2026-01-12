@@ -1,6 +1,6 @@
 const dgram = require('node:dgram')
 const { EventEmitter } = require('node:events')
-const { PeerConnection } = require('node-datachannel')
+const { RTCPeerConnection, RTCSessionDescription, RTCIceCandidate } = require('@roamhq/wrtc')
 
 const { Connection } = require('./connection')
 const { SignalStructure, SignalType } = require('./signalling')
@@ -29,14 +29,20 @@ class Server extends EventEmitter {
     const conn = this.connections.get(signal.connectionId)
 
     if (conn) {
-      conn.rtcConnection.addRemoteCandidate(signal.data, '0')
+      try {
+        const candidate = new RTCIceCandidate({ candidate: signal.data, sdpMid: '0', sdpMLineIndex: 0 })
+        await conn.rtcConnection.addIceCandidate(candidate)
+        debug('Added remote ICE candidate')
+      } catch (err) {
+        debug('Failed to add remote candidate:', err)
+      }
     } else {
       debug('Connection not found', signal.connectionId)
     }
   }
 
   async handleOffer (signal, respond, credentials = []) {
-    const rtcConnection = new PeerConnection('server', { iceServers: credentials })
+    const rtcConnection = new RTCPeerConnection({ iceServers: credentials })
 
     const connection = new Connection(this, signal.connectionId, rtcConnection)
 
@@ -44,32 +50,57 @@ class Server extends EventEmitter {
 
     debug('Received offer', signal.connectionId)
 
-    rtcConnection.onLocalDescription(description => {
-      debug('Local description', description)
-      respond(
-        new SignalStructure(SignalType.ConnectResponse, signal.connectionId, description, signal.networkId)
-      )
-    })
+    rtcConnection.onicecandidate = (event) => {
+      if (event.candidate) {
+        debug('Sending ICE candidate to client')
+        const signalStruct = new SignalStructure(SignalType.CandidateAdd, signal.connectionId, event.candidate.candidate, signal.networkId)
 
-    rtcConnection.onLocalCandidate(candidate => {
-      respond(
-        new SignalStructure(SignalType.CandidateAdd, signal.connectionId, candidate, signal.networkId)
-      )
-    })
+        respond(signalStruct)
+      }
+    }
 
-    rtcConnection.onDataChannel(channel => {
-      debug('Received data channel', channel.getLabel())
-      if (channel.getLabel() === 'ReliableDataChannel') connection.setChannels(channel)
-      if (channel.getLabel() === 'UnreliableDataChannel') connection.setChannels(null, channel)
-    })
+    rtcConnection.ondatachannel = (event) => {
+      const channel = event.channel
+      debug('Received data channel', channel.label)
 
-    rtcConnection.onStateChange(state => {
+      channel.binaryType = 'arraybuffer'
+
+      if (channel.label === 'ReliableDataChannel') connection.setChannels(channel)
+      if (channel.label === 'UnreliableDataChannel') connection.setChannels(null, channel)
+    }
+
+    rtcConnection.onconnectionstatechange = () => {
+      const state = rtcConnection.connectionState
       debug('Server RTC state changed', state)
       if (state === 'connected') this.emit('openConnection', connection)
-      if (state === 'closed' || state === 'disconnected' || state === 'failed') this.emit('closeConnection', signal.connectionId, 'disconnected')
-    })
+      if (state === 'closed' || state === 'disconnected' || state === 'failed') {
+        this.emit('closeConnection', signal.connectionId, 'disconnected')
+      }
+    }
 
-    rtcConnection.setRemoteDescription(signal.data, 'offer')
+    rtcConnection.oniceconnectionstatechange = () => {
+      const state = rtcConnection.iceConnectionState
+      debug('Server ICE state changed:', state)
+      if (state === 'failed') {
+        this.emit('closeConnection', signal.connectionId, 'disconnected')
+      }
+    }
+
+    try {
+      const offer = new RTCSessionDescription({ type: 'offer', sdp: signal.data })
+      await rtcConnection.setRemoteDescription(offer)
+      debug('Set remote description (offer)')
+
+      const answer = await rtcConnection.createAnswer()
+      await rtcConnection.setLocalDescription(answer)
+      debug('Created and set local description (answer)')
+
+      respond(
+        new SignalStructure(SignalType.ConnectResponse, signal.connectionId, answer.sdp, signal.networkId)
+      )
+    } catch (err) {
+      debug('Failed to handle offer:', err)
+    }
   }
 
   processPacket (buffer, rinfo) {

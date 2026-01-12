@@ -10,27 +10,30 @@ class Connection {
     this.reliable = null
     this.unreliable = null
     this.promisedSegments = 0
-    this.buf = Buffer.alloc(0)
+    this.buf = null
     this.sendQueue = []
   }
 
   setChannels (reliable, unreliable) {
     if (reliable) {
       this.reliable = reliable
-      this.reliable.onMessage((msg) => {
-        this.handleMessage(msg)
-      })
-      this.reliable.onOpen(() => {
+
+      this.reliable.onmessage = (event) => {
+        this.handleMessage(event.data)
+      }
+
+      this.reliable.onopen = () => {
         this.flushQueue()
-      })
+      }
     }
+
     if (unreliable) {
       this.unreliable = unreliable
     }
   }
 
   handleMessage (data) {
-    if (typeof data === 'string' || data instanceof ArrayBuffer) {
+    if (!(data instanceof Buffer)) {
       data = Buffer.from(data)
     }
 
@@ -85,8 +88,9 @@ class Connection {
       const end = Math.min(i + MAX_MESSAGE_SIZE, data.length)
       const frag = data.subarray(i, end)
       const message = Buffer.concat([Buffer.from([segments]), frag])
-      debug('Sending fragment', segments)
-      this.reliable.sendMessageBinary(message)
+
+      this.reliable.send(message)
+
       n += frag.length
     }
 
@@ -98,7 +102,6 @@ class Connection {
   }
 
   flushQueue () {
-    debug('Flushing send queue')
     while (this.sendQueue.length > 0) {
       const data = this.sendQueue.shift()
       this.sendNow(data)
