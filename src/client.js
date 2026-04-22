@@ -1,7 +1,7 @@
 const dgram = require('node:dgram')
 const { EventEmitter } = require('node:events')
 const { Connection } = require('./connection')
-const { SignalType, SignalStructure } = require('./signalling')
+const { ErrorCode, SignalType, SignalStructure } = require('./signalling')
 
 const { getRandomUint64, createPacketData, prepareSecurePacket, processSecurePacket } = require('./util')
 const { RTCPeerConnection, RTCSessionDescription, RTCIceCandidate } = require('@roamhq/wrtc')
@@ -12,18 +12,20 @@ const debug = require('debug')('nethernet')
 const PORT = 7551
 const BROADCAST_ADDRESS = '255.255.255.255'
 const SOCKET_CLOSE_TIMEOUT_MS = 100
+const DEFAULT_RESPONSE_TIMEOUT_MS = 15_000
+const DEFAULT_INACTIVITY_TIMEOUT_MS = 5_000
 
 class Client extends EventEmitter {
-  constructor (networkId, broadcastAddress = BROADCAST_ADDRESS) {
+  constructor (networkId, broadcastAddress = BROADCAST_ADDRESS, options = {}) {
     super()
 
     this.serverNetworkId = networkId
 
     this.broadcastAddress = broadcastAddress
 
-    this.networkId = getRandomUint64()
+    this.networkId = options.networkId ?? getRandomUint64()
 
-    this.connectionId = getRandomUint64()
+    this.connectionId = options.connectionId ?? getRandomUint64()
 
     this.socket = dgram.createSocket('udp4')
 
@@ -41,7 +43,9 @@ class Client extends EventEmitter {
     this.responses = new Map()
     this.addresses = new Map()
 
-    this.credentials = []
+    this.credentials = options.credentials ?? options.iceServers ?? []
+    this.responseTimeoutMs = options.responseTimeoutMs ?? DEFAULT_RESPONSE_TIMEOUT_MS
+    this.inactivityTimeoutMs = options.inactivityTimeoutMs ?? DEFAULT_INACTIVITY_TIMEOUT_MS
 
     this._signalHandler = this.sendDiscoveryMessage.bind(this)
 
@@ -54,6 +58,7 @@ class Client extends EventEmitter {
     this._hasEmittedConnected = false
     this._pendingConnect = false
     this._externalSignaling = false
+    this._negotiationTimeout = null
   }
 
   // Auto-detect external signalling when handler is replaced
@@ -65,6 +70,79 @@ class Client extends EventEmitter {
 
   get signalHandler () {
     return this._signalHandler
+  }
+
+  handleConnectionClosed (connection, reason = 'disconnected') {
+    this.clearNegotiationTimeouts()
+
+    if (this.connection === connection) {
+      this.connection = null
+    }
+    if (this.rtcConnection === connection.rtcConnection) {
+      this.rtcConnection = null
+    }
+    this.emit('disconnect', connection.address, reason)
+  }
+
+  signalError (networkId, code) {
+    if (networkId == null) {
+      return
+    }
+
+    this._signalHandler(new SignalStructure(SignalType.ConnectError, this.connectionId, String(code), networkId))
+  }
+
+  clearNegotiationTimeouts () {
+    if (this._negotiationTimeout) {
+      clearTimeout(this._negotiationTimeout)
+      this._negotiationTimeout = null
+    }
+  }
+
+  armNegotiationTimeout (code, timeoutMs) {
+    this.clearNegotiationTimeouts()
+
+    if (timeoutMs <= 0) {
+      return
+    }
+
+    this._negotiationTimeout = setTimeout(() => {
+      this.failNegotiation(this.serverNetworkId, code)
+    }, timeoutMs)
+  }
+
+  failNegotiation (networkId, code) {
+    this.clearNegotiationTimeouts()
+
+    try {
+      this.signalError(networkId, code)
+    } catch (err) {
+      debug('Failed to signal local error:', err)
+    }
+
+    const reason = `connecterror:${code}`
+
+    if (this.connection) {
+      this.connection.close(reason)
+      return
+    }
+
+    this.rtcConnection?.close()
+    this.rtcConnection = null
+  }
+
+  isExpectedSignal (signal) {
+    if (signal.connectionId?.toString() !== this.connectionId.toString()) {
+      debug('Ignoring signal for unexpected connection:', signal.connectionId)
+      return false
+    }
+
+    if (signal.networkId != null && signal.networkId.toString() !== this.serverNetworkId.toString()) {
+      debug('Ignoring signal from unexpected network:', signal.networkId)
+      return false
+    }
+
+    return true
   }
 
   async handleCandidate (signal) {
@@ -80,16 +158,21 @@ class Client extends EventEmitter {
       debug('Added remote ICE candidate')
     } catch (err) {
       debug('Failed to add remote candidate:', err)
+      this.failNegotiation(signal.networkId, ErrorCode.CandidateAdd)
     }
   }
 
   async handleAnswer (signal) {
+    this.clearNegotiationTimeouts()
+
     try {
       const answer = new RTCSessionDescription({ type: 'answer', sdp: signal.data })
       await this.rtcConnection.setRemoteDescription(answer)
       debug('Set remote description (answer)')
+      this.armNegotiationTimeout(ErrorCode.InactivityTimeout, this.inactivityTimeoutMs)
     } catch (err) {
       debug('Failed to set remote description:', err)
+      this.failNegotiation(signal.networkId, ErrorCode.FailedToSetRemoteDescription)
     }
   }
 
@@ -97,10 +180,11 @@ class Client extends EventEmitter {
     debug('Creating RTCPeerConnection with ICE servers:', this.credentials)
 
     this.rtcConnection = new RTCPeerConnection({ iceServers: this.credentials })
+    const rtcConnection = this.rtcConnection
 
-    this.connection = new Connection(this, this.connectionId, this.rtcConnection)
+    this.connection = new Connection(this, this.connectionId, rtcConnection)
 
-    this.rtcConnection.onicecandidate = (event) => {
+    rtcConnection.onicecandidate = (event) => {
       if (event.candidate) {
         debug('Sending CandidateAdd to networkId:', this.serverNetworkId)
         const signal = new SignalStructure(SignalType.CandidateAdd, this.connectionId, event.candidate.candidate, this.serverNetworkId)
@@ -109,65 +193,86 @@ class Client extends EventEmitter {
       }
     }
 
-    this.rtcConnection.onconnectionstatechange = () => {
-      const state = this.rtcConnection.connectionState
+    rtcConnection.onconnectionstatechange = () => {
+      const state = rtcConnection.connectionState
       debug('Client connection state changed:', state)
       if (state === 'connected' && !this._hasEmittedConnected) {
+        this.clearNegotiationTimeouts()
         this._hasEmittedConnected = true
         this.emit('connected', this.connection)
       }
       if (state === 'closed' || state === 'disconnected' || state === 'failed') {
-        this.emit('disconnect', this.connectionId, 'disconnected')
+        this.connection?.notifyClosed('disconnected')
       }
     }
 
-    this.rtcConnection.oniceconnectionstatechange = () => {
-      const state = this.rtcConnection.iceConnectionState
+    rtcConnection.oniceconnectionstatechange = () => {
+      const state = rtcConnection.iceConnectionState
       debug('Client ICE state changed:', state)
       if (state === 'failed') {
-        this.emit('disconnect', this.connectionId, 'disconnected')
+        this.connection?.notifyClosed('disconnected')
       }
     }
 
-    const reliableChannel = this.rtcConnection.createDataChannel('ReliableDataChannel', { ordered: true })
-    const unreliableChannel = this.rtcConnection.createDataChannel('UnreliableDataChannel', { ordered: false, maxRetransmits: 0 })
+    const reliableChannel = rtcConnection.createDataChannel('ReliableDataChannel', { ordered: true })
+    const unreliableChannel = rtcConnection.createDataChannel('UnreliableDataChannel', { ordered: false, maxRetransmits: 0 })
 
     reliableChannel.binaryType = 'arraybuffer'
     unreliableChannel.binaryType = 'arraybuffer'
 
     this.connection.setChannels(reliableChannel, unreliableChannel)
 
+    let offer
     try {
-      const offer = await this.rtcConnection.createOffer()
+      offer = await this.rtcConnection.createOffer()
+    } catch (err) {
+      debug('Failed to create offer:', err)
+      this.failNegotiation(this.serverNetworkId, ErrorCode.FailedToCreateOffer)
+      this.emit('error', new Error(`Failed to create offer: ${err.message}`))
+      return
+    }
 
+    try {
       await this.rtcConnection.setLocalDescription(offer)
+    } catch (err) {
+      debug('Failed to set local description:', err)
+      this.failNegotiation(this.serverNetworkId, ErrorCode.FailedToSetLocalDescription)
+      this.emit('error', new Error(`Failed to set local description: ${err.message}`))
+      return
+    }
 
+    try {
       const localDesc = this.rtcConnection.localDescription
 
       this._signalHandler(
         new SignalStructure(SignalType.ConnectRequest, this.connectionId, localDesc.sdp, this.serverNetworkId)
       )
     } catch (err) {
-      debug('Failed to create offer:', err)
-      this.emit('error', new Error(`Failed to create offer: ${err.message}`))
+      debug('Failed to signal offer:', err)
+      this.failNegotiation(this.serverNetworkId, ErrorCode.SignalingFailedToSend)
+      this.emit('error', new Error(`Failed to signal offer: ${err.message}`))
     }
   }
 
   processPacket (buffer, rinfo) {
-    const parsedPacket = processSecurePacket(buffer, this.deserializer)
-    debug('Received packet', parsedPacket)
+    try {
+      const parsedPacket = processSecurePacket(buffer, this.deserializer)
+      debug('Received packet', parsedPacket)
 
-    switch (parsedPacket.name) {
-      case 'discovery_request':
-        break
-      case 'discovery_response':
-        this.handleResponse(parsedPacket, rinfo)
-        break
-      case 'discovery_message':
-        this.handleMessage(parsedPacket)
-        break
-      default:
-        throw new Error('Unknown packet type')
+      switch (parsedPacket.name) {
+        case 'discovery_request':
+          break
+        case 'discovery_response':
+          this.handleResponse(parsedPacket, rinfo)
+          break
+        case 'discovery_message':
+          this.handleMessage(parsedPacket)
+          break
+        default:
+          throw new Error('Unknown packet type')
+      }
+    } catch (err) {
+      debug('Dropping invalid discovery packet:', err)
     }
   }
 
@@ -181,14 +286,19 @@ class Client extends EventEmitter {
     const serverIdMatches = senderId.toString() === this.serverNetworkId.toString()
     if (this._pendingConnect && serverIdMatches) {
       this._pendingConnect = false
+      this.armNegotiationTimeout(ErrorCode.NegotiationTimeoutWaitingForResponse, this.responseTimeoutMs)
       this.createOffer()
     }
   }
 
   handleMessage (packet) {
+    if (BigInt(packet.params.recipient_id).toString() !== this.networkId.toString()) {
+      return
+    }
+
     const data = packet.params.data
 
-    if (data === 'Ping') {
+    if (data === 'Ping' || data === '') {
       return
     }
 
@@ -200,12 +310,19 @@ class Client extends EventEmitter {
   }
 
   handleSignal (signal) {
+    if (!this.isExpectedSignal(signal)) {
+      return
+    }
+
     switch (signal.type) {
       case SignalType.ConnectResponse:
         this.handleAnswer(signal)
         break
       case SignalType.CandidateAdd:
         this.handleCandidate(signal)
+        break
+      case SignalType.ConnectError:
+        this.connection?.close(`connecterror:${signal.data}`)
         break
     }
   }
@@ -234,10 +351,12 @@ class Client extends EventEmitter {
 
   connect () {
     this.running = true
+    this._hasEmittedConnected = false
 
     const hasAddress = this.addresses.has(this.serverNetworkId)
 
     if (this._externalSignaling || hasAddress) {
+      this.armNegotiationTimeout(ErrorCode.NegotiationTimeoutWaitingForResponse, this.responseTimeoutMs)
       this.createOffer()
     } else {
       this._pendingConnect = true
@@ -245,6 +364,10 @@ class Client extends EventEmitter {
   }
 
   send (buffer) {
+    if (!this.connection) {
+      throw new Error('Connection is not open')
+    }
+
     this.connection.send(buffer)
   }
 
@@ -258,9 +381,11 @@ class Client extends EventEmitter {
     debug('Closing client', reason)
     if (!this.running) return
     clearInterval(this.pingInterval)
-    this.connection?.close()
+    this.clearNegotiationTimeouts()
+    this.connection?.close(reason)
     setTimeout(() => this.socket.close(), SOCKET_CLOSE_TIMEOUT_MS)
     this.connection = null
+    this.rtcConnection = null
     this.running = false
     this.removeAllListeners()
   }

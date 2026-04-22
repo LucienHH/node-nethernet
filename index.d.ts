@@ -23,7 +23,7 @@ declare module 'nethernet' {
     unreliable: DataChannel | null;
     promisedSegments: number;
     buf: Buffer | null;
-    sendQueue: Buffer[];      
+    sendQueue: Buffer[];
 
     constructor(nethernet: Client | Server, address: bigint, rtcConnection: PeerConnection);
     setChannels(reliable?: DataChannel | null, unreliable?: DataChannel | null): void;
@@ -36,6 +36,9 @@ declare module 'nethernet' {
 
   export interface ServerOptions {
     networkId?: bigint;
+    credentials?: (string | IceServer)[];
+    iceServers?: (string | IceServer)[];
+    acceptTimeoutMs?: number;
   }
 
   export interface ServerEvents {
@@ -47,6 +50,8 @@ declare module 'nethernet' {
 
   export class Server extends EventEmitter {
     options: ServerOptions;
+    credentials: (string | IceServer)[];
+    acceptTimeoutMs: number;
     networkId: bigint;
     connections: Map<bigint, Connection>;
     advertisement?: Buffer;
@@ -73,7 +78,16 @@ declare module 'nethernet' {
     disconnect: (connectionId: bigint, reason: string) => void;
     encapsulated: (data: Buffer, connectionId: bigint) => void;
     pong: (packet: any) => void;
-  }  
+  }
+
+  export interface ClientOptions {
+    networkId?: bigint;
+    connectionId?: bigint;
+    credentials?: (string | IceServer)[];
+    iceServers?: (string | IceServer)[];
+    responseTimeoutMs?: number;
+    inactivityTimeoutMs?: number;
+  }
 
   export class Client extends EventEmitter {
     serverNetworkId: bigint;
@@ -86,13 +100,16 @@ declare module 'nethernet' {
     responses: Map<bigint, any>;
     addresses: Map<bigint, RemoteInfo>;
     credentials: (string | IceServer)[];
+    responseTimeoutMs: number;
+    inactivityTimeoutMs: number;
     signalHandler: (signal: SignalStructure) => void;
     connection?: Connection;
     rtcConnection?: PeerConnection;
     pingInterval?: NodeJS.Timeout;
     running: boolean;
-  
+
     constructor(networkId: bigint, broadcastAddress?: string);
+    constructor(networkId: bigint, broadcastAddress: string | undefined, options: ClientOptions);
     handleCandidate(signal: SignalStructure): Promise<void>;
     handleAnswer(signal: SignalStructure): Promise<void>;
     createOffer(): Promise<void>;
@@ -116,6 +133,36 @@ declare module 'nethernet' {
     ConnectResponse = 'CONNECTRESPONSE',
     CandidateAdd = 'CANDIDATEADD',
     ConnectError = 'CONNECTERROR'
+  }
+
+  export enum ErrorCode {
+    None = 0,
+    DestinationNotLoggedIn = 1,
+    NegotiationTimeout = 2,
+    WrongTransportVersion = 3,
+    FailedToCreatePeerConnection = 4,
+    ICE = 5,
+    ConnectRequest = 6,
+    ConnectResponse = 7,
+    CandidateAdd = 8,
+    InactivityTimeout = 9,
+    FailedToCreateOffer = 10,
+    FailedToCreateAnswer = 11,
+    FailedToSetLocalDescription = 12,
+    FailedToSetRemoteDescription = 13,
+    NegotiationTimeoutWaitingForResponse = 14,
+    NegotiationTimeoutWaitingForAccept = 15,
+    IncomingConnectionIgnored = 16,
+    SignalingParsingFailure = 17,
+    SignalingUnknownError = 18,
+    SignalingUnicastMessageDeliveryFailed = 19,
+    SignalingBroadcastDeliveryFailed = 20,
+    SignalingMessageDeliveryFailed = 21,
+    SignalingTurnAuthFailed = 22,
+    SignalingFallbackToBestEffortDelivery = 23,
+    NoSignalingChannel = 24,
+    NotLoggedIn = 25,
+    SignalingFailedToSend = 26
   }
 
   export class SignalStructure {

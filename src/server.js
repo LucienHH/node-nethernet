@@ -3,13 +3,29 @@ const { EventEmitter } = require('node:events')
 const { RTCPeerConnection, RTCSessionDescription, RTCIceCandidate } = require('@roamhq/wrtc')
 
 const { Connection } = require('./connection')
-const { SignalStructure, SignalType } = require('./signalling')
+const { ErrorCode, SignalStructure, SignalType } = require('./signalling')
 
 const { PACKET_TYPE, createSerializer, createDeserializer } = require('./serializer')
 
 const { getRandomUint64, createPacketData, prepareSecurePacket, processSecurePacket } = require('./util')
 
 const debug = require('debug')('nethernet')
+const DEFAULT_ACCEPT_TIMEOUT_MS = 5_000
+
+const EXPECTED_CHANNELS = {
+  ReliableDataChannel: {
+    ordered: true,
+    maxRetransmits: null
+  },
+  UnreliableDataChannel: {
+    ordered: false,
+    maxRetransmits: 0
+  }
+}
+
+function isExpectedDataChannel (channel) {
+  return Object.hasOwn(EXPECTED_CHANNELS, channel.label)
+}
 
 class Server extends EventEmitter {
   constructor (options = {}) {
@@ -18,14 +34,63 @@ class Server extends EventEmitter {
     this.options = options
 
     this.networkId = options.networkId ?? getRandomUint64()
+    this.credentials = options.credentials ?? options.iceServers ?? []
+    this.acceptTimeoutMs = options.acceptTimeoutMs ?? DEFAULT_ACCEPT_TIMEOUT_MS
 
     this.connections = new Map()
+    this.acceptTimeouts = new Map()
 
     this.serializer = createSerializer()
     this.deserializer = createDeserializer()
   }
 
-  async handleCandidate (signal) {
+  handleConnectionClosed (connection, reason = 'disconnected') {
+    this.clearAcceptTimeout(connection.address)
+    this.connections.delete(connection.address)
+    this.emit('closeConnection', connection.address, reason)
+  }
+
+  clearAcceptTimeout (connectionId) {
+    const acceptTimeout = this.acceptTimeouts.get(connectionId)
+    if (!acceptTimeout) {
+      return
+    }
+
+    clearTimeout(acceptTimeout)
+    this.acceptTimeouts.delete(connectionId)
+  }
+
+  armAcceptTimeout (connection, signal, respond) {
+    this.clearAcceptTimeout(connection.address)
+
+    if (this.acceptTimeoutMs <= 0) {
+      return
+    }
+
+    const acceptTimeout = setTimeout(() => {
+      this.acceptTimeouts.delete(connection.address)
+
+      if (this.connections.get(connection.address) !== connection) {
+        return
+      }
+
+      try {
+        this.signalError(respond, signal, ErrorCode.NegotiationTimeoutWaitingForAccept)
+      } catch (err) {
+        debug('Failed to signal accept timeout:', err)
+      }
+
+      connection.close(`connecterror:${ErrorCode.NegotiationTimeoutWaitingForAccept}`)
+    }, this.acceptTimeoutMs)
+
+    this.acceptTimeouts.set(connection.address, acceptTimeout)
+  }
+
+  signalError (respond, signal, code) {
+    respond(new SignalStructure(SignalType.ConnectError, signal.connectionId, String(code), signal.networkId))
+  }
+
+  async handleCandidate (signal, respond) {
     const conn = this.connections.get(signal.connectionId)
 
     if (conn) {
@@ -35,16 +100,43 @@ class Server extends EventEmitter {
         debug('Added remote ICE candidate')
       } catch (err) {
         debug('Failed to add remote candidate:', err)
+        conn.close('candidateaddfailed')
+        if (respond) {
+          this.signalError(respond, signal, ErrorCode.CandidateAdd)
+        }
       }
     } else {
       debug('Connection not found', signal.connectionId)
     }
   }
 
-  async handleOffer (signal, respond, credentials = []) {
-    const rtcConnection = new RTCPeerConnection({ iceServers: credentials })
+  async handleOffer (signal, respond, credentials = this.credentials) {
+    let rtcConnection
+    try {
+      rtcConnection = new RTCPeerConnection({ iceServers: credentials })
+    } catch (err) {
+      debug('Failed to create RTCPeerConnection:', err)
+      this.signalError(respond, signal, ErrorCode.FailedToCreatePeerConnection)
+      return
+    }
 
     const connection = new Connection(this, signal.connectionId, rtcConnection)
+    const registeredChannels = new Set()
+    let hasEmittedOpen = false
+
+    const emitOpenConnection = () => {
+      if (hasEmittedOpen || registeredChannels.size !== Object.keys(EXPECTED_CHANNELS).length) {
+        return
+      }
+
+      if (rtcConnection.connectionState !== 'connected') {
+        return
+      }
+
+      this.clearAcceptTimeout(connection.address)
+      hasEmittedOpen = true
+      this.emit('openConnection', connection)
+    }
 
     this.connections.set(signal.connectionId, connection)
 
@@ -63,18 +155,37 @@ class Server extends EventEmitter {
       const channel = event.channel
       debug('Received data channel', channel.label)
 
+      if (!isExpectedDataChannel(channel)) {
+        debug('Invalid data channel opened', channel.label)
+        this.signalError(respond, signal, ErrorCode.IncomingConnectionIgnored)
+        connection.close('invaliddatachannel')
+        return
+      }
+
+      if (registeredChannels.has(channel.label)) {
+        debug('Duplicate data channel opened', channel.label)
+        this.signalError(respond, signal, ErrorCode.IncomingConnectionIgnored)
+        connection.close('duplicatedatachannel')
+        return
+      }
+
       channel.binaryType = 'arraybuffer'
+      registeredChannels.add(channel.label)
 
       if (channel.label === 'ReliableDataChannel') connection.setChannels(channel)
       if (channel.label === 'UnreliableDataChannel') connection.setChannels(null, channel)
+
+      emitOpenConnection()
     }
 
     rtcConnection.onconnectionstatechange = () => {
       const state = rtcConnection.connectionState
       debug('Server RTC state changed', state)
-      if (state === 'connected') this.emit('openConnection', connection)
+      if (state === 'connected') {
+        emitOpenConnection()
+      }
       if (state === 'closed' || state === 'disconnected' || state === 'failed') {
-        this.emit('closeConnection', signal.connectionId, 'disconnected')
+        connection.notifyClosed('disconnected')
       }
     }
 
@@ -82,7 +193,7 @@ class Server extends EventEmitter {
       const state = rtcConnection.iceConnectionState
       debug('Server ICE state changed:', state)
       if (state === 'failed') {
-        this.emit('closeConnection', signal.connectionId, 'disconnected')
+        connection.notifyClosed('disconnected')
       }
     }
 
@@ -90,34 +201,64 @@ class Server extends EventEmitter {
       const offer = new RTCSessionDescription({ type: 'offer', sdp: signal.data })
       await rtcConnection.setRemoteDescription(offer)
       debug('Set remote description (offer)')
+    } catch (err) {
+      debug('Failed to set remote description (offer):', err)
+      this.signalError(respond, signal, ErrorCode.FailedToSetRemoteDescription)
+      connection.close('offerfailed')
+      return
+    }
 
-      const answer = await rtcConnection.createAnswer()
+    let answer
+    try {
+      answer = await rtcConnection.createAnswer()
+    } catch (err) {
+      debug('Failed to create answer:', err)
+      this.signalError(respond, signal, ErrorCode.FailedToCreateAnswer)
+      connection.close('answerfailed')
+      return
+    }
+
+    try {
       await rtcConnection.setLocalDescription(answer)
       debug('Created and set local description (answer)')
+    } catch (err) {
+      debug('Failed to set local description (answer):', err)
+      this.signalError(respond, signal, ErrorCode.FailedToSetLocalDescription)
+      connection.close('answerfailed')
+      return
+    }
 
+    try {
       respond(
         new SignalStructure(SignalType.ConnectResponse, signal.connectionId, answer.sdp, signal.networkId)
       )
+      this.armAcceptTimeout(connection, signal, respond)
     } catch (err) {
-      debug('Failed to handle offer:', err)
+      debug('Failed to signal answer:', err)
+      this.signalError(respond, signal, ErrorCode.SignalingFailedToSend)
+      connection.close('signalingfailed')
     }
   }
 
   processPacket (buffer, rinfo) {
-    const parsedPacket = processSecurePacket(buffer, this.deserializer)
-    debug('Received packet', parsedPacket)
+    try {
+      const parsedPacket = processSecurePacket(buffer, this.deserializer)
+      debug('Received packet', parsedPacket)
 
-    switch (parsedPacket.name) {
-      case 'discovery_request':
-        this.handleRequest(rinfo)
-        break
-      case 'discovery_response':
-        break
-      case 'discovery_message':
-        this.handleMessage(parsedPacket, rinfo)
-        break
-      default:
-        throw new Error('Unknown packet type')
+      switch (parsedPacket.name) {
+        case 'discovery_request':
+          this.handleRequest(rinfo)
+          break
+        case 'discovery_response':
+          break
+        case 'discovery_message':
+          this.handleMessage(parsedPacket, rinfo)
+          break
+        default:
+          throw new Error('Unknown packet type')
+      }
+    } catch (err) {
+      debug('Dropping invalid discovery packet:', err)
     }
   }
 
@@ -143,8 +284,13 @@ class Server extends EventEmitter {
   }
 
   handleMessage (packet, rinfo) {
+    if (BigInt(packet.params.recipient_id).toString() !== this.networkId.toString()) {
+      return
+    }
+
     const data = packet.params.data
-    if (data === 'Ping') {
+    debug('Received discovery message', data)
+    if (data === 'Ping' || data === '') {
       return
     }
 
@@ -169,7 +315,10 @@ class Server extends EventEmitter {
         this.handleOffer(signal, respond)
         break
       case SignalType.CandidateAdd:
-        this.handleCandidate(signal)
+        this.handleCandidate(signal, respond)
+        break
+      case SignalType.ConnectError:
+        this.connections.get(signal.connectionId)?.close(`connecterror:${signal.data}`)
         break
     }
   }
