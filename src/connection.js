@@ -12,6 +12,7 @@ class Connection {
     this.promisedSegments = 0
     this.buf = null
     this.sendQueue = []
+    this.closed = false
   }
 
   setChannels (reliable, unreliable) {
@@ -25,10 +26,26 @@ class Connection {
       this.reliable.onopen = () => {
         this.flushQueue()
       }
+
+      this.reliable.onclose = () => {
+        this.notifyClosed('disconnected')
+      }
+
+      this.reliable.onerror = () => {
+        this.notifyClosed('disconnected')
+      }
     }
 
     if (unreliable) {
       this.unreliable = unreliable
+
+      this.unreliable.onclose = () => {
+        this.notifyClosed('disconnected')
+      }
+
+      this.unreliable.onerror = () => {
+        this.notifyClosed('disconnected')
+      }
     }
   }
 
@@ -108,7 +125,20 @@ class Connection {
     }
   }
 
-  close () {
+  notifyClosed (reason = 'disconnected') {
+    if (this.closed) {
+      return
+    }
+
+    this.closed = true
+    this.buf = null
+    this.sendQueue.length = 0
+    this.nethernet.handleConnectionClosed?.(this, reason)
+  }
+
+  close (reason = 'closed') {
+    this.notifyClosed(reason)
+
     if (this.reliable) {
       this.reliable.close()
     }
